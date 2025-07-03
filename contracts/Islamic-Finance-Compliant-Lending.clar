@@ -9,6 +9,10 @@
 (define-constant ERR_LOAN_EXPIRED (err u107))
 (define-constant ERR_EARLY_REPAYMENT (err u108))
 
+(define-constant ERR_INVALID_BUSINESS_TYPE (err u109))
+(define-constant ERR_COMPLIANCE_SCORE_EXISTS (err u110))
+
+
 (define-data-var next-loan-id uint u1)
 (define-data-var total-pool-funds uint u0)
 
@@ -239,3 +243,119 @@
     false
   )
 )
+
+
+(define-map business-categories
+  { category: (string-ascii 20) }
+  { halal-score: uint, risk-multiplier: uint }
+)
+
+(define-map loan-compliance-scores
+  { loan-id: uint }
+  { 
+    compliance-score: uint,
+    business-category-score: uint,
+    profit-share-score: uint,
+    duration-score: uint,
+    borrower-history-score: uint,
+    overall-rating: (string-ascii 20)
+  }
+)
+
+(define-private (initialize-business-categories)
+  (begin
+    (map-set business-categories { category: "halal-food" } { halal-score: u95, risk-multiplier: u10 })
+    (map-set business-categories { category: "islamic-banking" } { halal-score: u100, risk-multiplier: u5 })
+    (map-set business-categories { category: "textile" } { halal-score: u85, risk-multiplier: u15 })
+    (map-set business-categories { category: "technology" } { halal-score: u90, risk-multiplier: u12 })
+    (map-set business-categories { category: "healthcare" } { halal-score: u95, risk-multiplier: u8 })
+    (map-set business-categories { category: "education" } { halal-score: u100, risk-multiplier: u5 })
+    (map-set business-categories { category: "retail" } { halal-score: u80, risk-multiplier: u18 })
+    (map-set business-categories { category: "manufacturing" } { halal-score: u85, risk-multiplier: u20 })
+    (map-set business-categories { category: "services" } { halal-score: u88, risk-multiplier: u15 })
+    (map-set business-categories { category: "other" } { halal-score: u70, risk-multiplier: u25 })
+  )
+)
+
+(define-private (calculate-profit-share-score (profit-share uint))
+  (if (<= profit-share u15)
+    u100
+    (if (<= profit-share u25)
+      u85
+      (if (<= profit-share u35)
+        u70
+        u50
+      )
+    )
+  )
+)
+
+(define-private (calculate-duration-score (duration uint))
+  (if (<= duration u5000)
+    u100
+    (if (<= duration u10000)
+      u85
+      (if (<= duration u15000)
+        u70
+        u50
+      )
+    )
+  )
+)
+
+(define-private (calculate-borrower-history-score (borrower principal))
+  (match (map-get? borrower-profile { borrower: borrower })
+    profile
+    (let ((success-rate (if (> (get total-borrowed profile) u0)
+                           (/ (* (get successful-loans profile) u100) 
+                              (+ (get successful-loans profile) (get default-count profile)))
+                           u100)))
+      (if (>= success-rate u95) u100
+        (if (>= success-rate u80) u85
+          (if (>= success-rate u70) u70
+            u50))))
+    u100
+  )
+)
+
+(define-public (calculate-compliance-score (loan-id uint) (business-category (string-ascii 20)))
+  (let ((loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+        (category-data (unwrap! (map-get? business-categories { category: business-category }) ERR_INVALID_BUSINESS_TYPE)))
+    (if (is-none (map-get? loan-compliance-scores { loan-id: loan-id }))
+      (let ((business-score (get halal-score category-data))
+            (profit-score (calculate-profit-share-score (get profit-share-percentage loan-data)))
+            (duration-score (calculate-duration-score (get duration-blocks loan-data)))
+            (history-score (calculate-borrower-history-score (get borrower loan-data)))
+            (overall-score (/ (+ business-score profit-score duration-score history-score) u4)))
+        (begin
+          (map-set loan-compliance-scores
+            { loan-id: loan-id }
+            {
+              compliance-score: overall-score,
+              business-category-score: business-score,
+              profit-share-score: profit-score,
+              duration-score: duration-score,
+              borrower-history-score: history-score,
+              overall-rating: (if (>= overall-score u90) "excellent"
+                                (if (>= overall-score u80) "good"
+                                  (if (>= overall-score u70) "acceptable"
+                                    "poor")))
+            }
+          )
+          (ok overall-score)
+        )
+      )
+      ERR_COMPLIANCE_SCORE_EXISTS
+    )
+  )
+)
+
+(define-read-only (get-compliance-score (loan-id uint))
+  (map-get? loan-compliance-scores { loan-id: loan-id })
+)
+
+(define-read-only (get-business-category-info (category (string-ascii 20)))
+  (map-get? business-categories { category: category })
+)
+
+(initialize-business-categories)
