@@ -9,6 +9,11 @@
 (define-constant ERR_LOAN_EXPIRED (err u107))
 (define-constant ERR_EARLY_REPAYMENT (err u108))
 
+(define-constant ERR_NO_COLLATERAL (err u111))
+(define-constant ERR_LIQUIDATION_ACTIVE (err u112))
+(define-constant GRACE_PERIOD_BLOCKS u1000)
+(define-constant LIQUIDATION_PENALTY_RATE u10)
+
 (define-constant ERR_INVALID_BUSINESS_TYPE (err u109))
 (define-constant ERR_COMPLIANCE_SCORE_EXISTS (err u110))
 
@@ -358,4 +363,73 @@
   (map-get? business-categories { category: category })
 )
 
-(initialize-business-categories)
+
+
+
+(define-map loan-collateral
+  { loan-id: uint }
+  { collateral-amount: uint, collateral-type: (string-ascii 30), liquidation-start: uint }
+)
+
+(define-map liquidation-queue
+  { loan-id: uint }
+  { grace-expires: uint, penalty-amount: uint, notified: bool }
+)
+
+(define-public (pledge-collateral (loan-id uint) (amount uint) (collateral-type (string-ascii 30)))
+  (let ((loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND)))
+    (if (and (is-eq tx-sender (get borrower loan-data)) (> amount u0))
+      (begin
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (map-set loan-collateral
+          { loan-id: loan-id }
+          { collateral-amount: amount, collateral-type: collateral-type, liquidation-start: u0 }
+        )
+        (ok amount)
+      )
+      ERR_NOT_AUTHORIZED
+    )
+  )
+)
+
+(define-public (initiate-liquidation (loan-id uint))
+  (let ((loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+        (collateral (unwrap! (map-get? loan-collateral { loan-id: loan-id }) ERR_NO_COLLATERAL)))
+    (if (and (is-eq (get status loan-data) "active")
+             (> stacks-block-height (+ (get start-block loan-data) (get duration-blocks loan-data))))
+      (let ((penalty (/ (* (get collateral-amount collateral) LIQUIDATION_PENALTY_RATE) u100)))
+        (map-set liquidation-queue
+          { loan-id: loan-id }
+          { grace-expires: (+ stacks-block-height GRACE_PERIOD_BLOCKS),
+            penalty-amount: penalty, notified: false }
+        )
+        (map-set loan-collateral
+          { loan-id: loan-id }
+          (merge collateral { liquidation-start: stacks-block-height })
+        )
+        (ok true)
+      )
+      ERR_LOAN_NOT_ACTIVE
+    )
+  )
+)
+
+(define-public (execute-liquidation (loan-id uint))
+  (let ((liquidation-data (unwrap! (map-get? liquidation-queue { loan-id: loan-id }) ERR_LOAN_NOT_FOUND))
+        (collateral (unwrap! (map-get? loan-collateral { loan-id: loan-id }) ERR_NO_COLLATERAL))
+        (loan-data (unwrap! (map-get? loans { loan-id: loan-id }) ERR_LOAN_NOT_FOUND)))
+    (if (>= stacks-block-height (get grace-expires liquidation-data))
+      (let ((net-recovery (- (get collateral-amount collateral) (get penalty-amount liquidation-data))))
+        (try! (as-contract (stx-transfer? net-recovery tx-sender (get lender loan-data))))
+        (map-set loans { loan-id: loan-id } (merge loan-data { status: "liquidated" }))
+        (map-delete liquidation-queue { loan-id: loan-id })
+        (ok net-recovery)
+      )
+      ERR_EARLY_REPAYMENT
+    )
+  )
+)
+
+(define-read-only (get-liquidation-status (loan-id uint))
+  (map-get? liquidation-queue { loan-id: loan-id })
+)
